@@ -26,7 +26,7 @@ import {
   pickLocalizedText,
   resolveSubjectContentLang,
 } from "./src/data/curriculum.ts";
-import { DIAGNOSTIC_QUESTIONS } from "./src/data/difagnosticsBank.ts";
+import { DIAGNOSTIC_QUESTIONS } from "./src/data/diagnosticsBank.ts";
 import type {
   ChatThread,
   ClientDiagnosticQuestion,
