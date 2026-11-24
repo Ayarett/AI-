@@ -19,15 +19,25 @@ import {
   verifySecret,
   verifySessionToken,
 } from "./server/storage.ts";
-import { getSubjectById, getSubjectsForGrade } from "./src/data/curriculum.ts";
+import {
+  getCurriculumSummaryForPrompt,
+  getSubjectById,
+  getSubjectsForGrade,
+  pickLocalizedText,
+  resolveSubjectContentLang,
+} from "./src/data/curriculum.ts";
 import { DIAGNOSTIC_QUESTIONS } from "./src/data/diagnosticsBank.ts";
 import type {
   ChatThread,
+  ClientDiagnosticQuestion,
+  ContentLang,
   DiagnosticAttempt,
+  DiagnosticQuestion,
   DiagnosticTopicBreakdown,
   DifficultyLevel,
   Lang,
   PresentationSlide,
+  QuestionFormat,
   ScheduleConfig,
   ScheduleLesson,
   StudentTask,
@@ -42,9 +52,18 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
-const MODEL_NAME = "gemini-4-hydrogen";
-const FALLBACK_MODEL_NAME = "gemini-3.1-flash-lite";
+const MODEL_NAME = "gemini-2.5-flash";
+const THINKING_MODEL_NAME = "gemini-4-hydrogen";
+const FALLBACK_MODELS = [
+  "gemini-4-hydrogen",
+  "gemini-3.8-flash",
+  "gemini-3.1-flash-lite",
+];
 const SESSION_COOKIE_NAME = "ai_ustaz_session";
+const DIAGNOSTIC_SIGNING_KEY =
+  process.env.SESSION_SECRET ||
+  process.env.GEMINI_API_KEY ||
+  "ai-ustaz-diagnostic-signing-key";
 
 interface AuthedRequest extends Request {
   authUser?: UserProfile;
@@ -74,7 +93,7 @@ function rateLimit(maxRequests: number, windowMs: number) {
 }
 
 function getGeminiClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
     return null;
   }
@@ -242,14 +261,14 @@ async function generateContentSmart(
     config?: Record<string, unknown>;
   }
 ) {
-  const modelsToTry = [MODEL_NAME, FALLBACK_MODEL_NAME, "gemini-3.8-flash", MODEL_NAME];
+  const modelsToTry = [MODEL_NAME, ...FALLBACK_MODELS];
   const failures: string[] = [];
   let lastError: unknown;
   for (let i = 0; i < modelsToTry.length; i++) {
     const model = modelsToTry[i];
     try {
       const cfg = { ...(params.config ?? {}) };
-      if (model !== MODEL_NAME && "thinkingConfig" in cfg) {
+      if (model !== THINKING_MODEL_NAME && "thinkingConfig" in cfg) {
         delete cfg.thinkingConfig;
       }
       return await ai.models.generateContent({
@@ -263,7 +282,21 @@ async function generateContentSmart(
       const raw = err instanceof Error ? err.message : String(err);
       const code = errObj?.status;
       failures.push(`${model}:${code ?? "ERR"}`);
-      console.warn(`[AI Ұстаз Gemini] attempt ${i + 1} (${model}) failed:`, code ?? "ERR", sanitizeErrorDetail(raw));
+      console.warn(
+        `[AI Ұстаз Gemini] attempt ${i + 1} (${model}) failed:`,
+        code ?? "ERR",
+        sanitizeErrorDetail(raw)
+      );
+
+      const hasMoreModels = i < modelsToTry.length - 1;
+      const isModelUnavailableForKey =
+        hasMoreModels &&
+        (code === 404 ||
+          code === 429 ||
+          raw.includes("NOT_FOUND") ||
+          raw.includes("RESOURCE_EXHAUSTED") ||
+          raw.includes("no longer available") ||
+          raw.includes("is not found"));
       const isTransient =
         code === 503 ||
         code === 500 ||
@@ -272,10 +305,13 @@ async function generateContentSmart(
         raw.includes("UNAVAILABLE") ||
         raw.includes("503") ||
         raw.includes("high demand");
-      if (!isTransient) {
+
+      if (!isTransient && !isModelUnavailableForKey) {
         throw err;
       }
-      await new Promise((r) => setTimeout(r, 600 * (i + 1)));
+      if (isTransient) {
+        await new Promise((r) => setTimeout(r, 500 * (i + 1)));
+      }
     }
   }
   console.error("[AI Ұстаз Gemini] all models failed:", failures.join(", "));
@@ -284,6 +320,145 @@ async function generateContentSmart(
 
 function normalizeAnswer(val: string): string {
   return val.trim().toLowerCase().replace(",", ".").replace(/\s+/g, " ");
+}
+
+function getGradeRigorGuidance(grade: number): string {
+  const perGradeMap: Record<number, string> = {
+    1: "1 класс (ГОСО РК, начальная школа): только темы 1 класса — алфавит/Әліппе, слоги, счёт и сложение/вычитание в пределах 20, простые слова и предложения, базовые наблюдения о мире. ЗАПРЕЩЕНО давать темы 2–11 классов (таблицу умножения, дроби, уравнения, падежи, сложный синтаксис, физику/химию). Формулировки максимально короткие и понятные ребёнку 6–7 лет.",
+    2: "2 класс (ГОСО РК, начальная школа): сложение и вычитание в пределах 100 с переходом через десяток, начало таблицы умножения и деления, задачи в 1–2 действия, корень слова, безударные гласные, простые тексты. ЗАПРЕЩЕНО давать примитивный счёт в пределах 10 (уровень 1 класса) И ЗАПРЕЩЕНО давать темы 4–11 классов (многозначные числа, дроби, проценты, причастия, алгебру).",
+    3: "3 класс (ГОСО РК, начальная школа): внетабличное умножение и деление, доли, периметр и площадь прямоугольника, состав слова, части речи (существительное, прилагательное, глагол), простая грамматика. ЗАПРЕЩЕНО давать слишком лёгкие задания 1 класса И ЗАПРЕЩЕНО давать темы 5–11 классов (десятичные дроби, пропорции, причастные обороты, физику/алгебру).",
+    4: "4 класс (ГОСО РК, выпускной класс начальной школы): многозначные числа, задачи на движение и производительность, простые дроби/доли, склонение по падежам и спряжение глаголов, времена уровня A1. ЗАПРЕЩЕНО давать слишком лёгкие задания 1–2 классов И ЗАПРЕЩЕНО забегать в программу основной/старшей школы (отрицательные числа, линейные функции, квадратные уравнения, логарифмы, сложную стилистику).",
+    5: "5 класс (ГОСО РК, основная школа): натуральные числа и делимость, обыкновенные и десятичные дроби, проценты, базовый синтаксис и лексика, природоведение/история древнего мира. ЗАПРЕЩЕНО давать слишком лёгкие вопросы 1–4 классов И ЗАПРЕЩЕНО давать сложные темы 7–11 классов (ФСУ, квадратные уравнения, тригонометрию, органическую химию, производные).",
+    6: "6 класс (ГОСО РК, основная школа): отношения и пропорции, рациональные числа, координатная плоскость, линейные уравнения и неравенства с одной переменной, словообразование и морфология 6 класса, уровень A2. ЗАПРЕЩЕНО давать вопросы начальной школы (1–4 кл.) И ЗАПРЕЩЕНО давать темы 8–11 классов (дискриминант, стереометрию, производные, логарифмы, B2).",
+    7: "7 класс (ГОСО РК, основная школа): ФСУ и линейная функция (алгебра), начальные геометрические сведения и признаки равенства треугольников (геометрия), механика/плотность/давление (физика), строение атома и валентность (химия), клетка и ткани (биология), причастия и деепричастия. ЗАПРЕЩЕНО давать лёгкие вопросы 1–5 классов И ЗАПРЕЩЕНО давать темы 9–11 классов (производные, интегралы, логарифмы, органическую химию 10 кл., стереометрию).",
+    8: "8 класс (ГОСО РК, основная школа): квадратные корни, квадратные уравнения, теорема Виета, четырёхугольники и теорема Пифагора, тепловые и электрические явления, классы неорганических соединений, обособленные и односоставные предложения. ЗАПРЕЩЕНО давать лёгкие задания 1–6 классов И ЗАПРЕЩЕНО давать темы 10–11 классов (производные, интегралы, тригонометрические уравнения, синтез полимеров).",
+    9: "9 класс (ГОСО РК, предпрофильный класс основной школы): числовые последовательности и прогрессии, системы нелинейных уравнений и неравенств, векторы и тригонометрия треугольника, законы Ньютона и колебания, электролиты и основы органики, СПП и БСП, уровень B1. ЗАПРЕЩЕНО давать лёгкие задания 1–7 классов И ЗАПРЕЩЕНО давать темы 11 класса (определённый интеграл, объёмы тел вращения, квантовую физику).",
+    10: "10 класс (ГОСО РК, старшая школа / уровень ЕНТ): тригонометрические уравнения, производная и её применение, стереометрия в пространстве (параллельность и перпендикулярность), МКТ/термодинамика/электростатика, общая и органическая химия 10 кл., молекулярная биология и генетика, синтаксические и стилистические нормы, B1–B2. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО давать лёгкие вопросы 1–8 классов И не подменять программу 10 класса узкими темами 11 класса (определённым интегралом, телами вращения).",
+    11: "11 класс (ГОСО РК, выпускной класс / уровень ЕНТ): первообразная и определённый интеграл, показательные и логарифмические уравнения/неравенства, тела вращения и объёмы в стереометрии, электромагнитные волны/оптика/атомная и ядерная физика, полимеры и биоорганическая химия, академическая стилистика и риторика, B2+. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО давать примитивные вопросы 1–9 классов.",
+  };
+
+  const exactRule =
+    perGradeMap[grade] ??
+    `Строго программа ${grade} класса по ГОСО РК.`;
+
+  return [
+    `СТРОГАЯ ПРИВЯЗКА К ${grade} КЛАССУ И ГОСО РК:`,
+    `- ${exactRule}`,
+    `- Двусторонний фильтр сложности: формулировки, терминология и объём вычислений должны точно соответствовать возрасту и программе именно ${grade} класса Казахстана (не занижать до младших классов и не забегать в темы старших классов).`,
+  ].join("\n");
+}
+
+function getStrictLanguageDirective(contentLang: ContentLang): string {
+  if (contentLang === "ru") {
+    return `ЯЗЫКОВОЕ ПРАВИЛО (АБСОЛЮТНЫЙ ПРИОРИТЕТ): ВЕСЬ текст (названия тем goalLabel, тексты для чтения passage, формулировки вопросов prompt, все варианты ответов options, правильные ответы и пояснения explanation) должен быть написан СТРОГО НА РУССКОМ ЯЗЫКЕ, даже если интерфейс ученика на казахском. Запрещено вставлять казахские слова, заголовки или переводы.`;
+  }
+  if (contentLang === "en") {
+    return `STRICT LANGUAGE LOCK (HIGHEST PRIORITY): EVERY single field — including topic names (goalLabel), reading passages, question prompts, all answer options, short answers, and explanations — MUST be written STRICTLY IN NATURAL ACADEMIC ENGLISH. Zero Kazakh or Russian words anywhere in the output.`;
+  }
+  return `ТІЛДІК ЕРЕЖЕ (ҚАТАҢ БАСЫМДЫҚ): Барлық мәтіндер (тақырып атаулары goalLabel, мәтін үзінділері passage, сұрақтар prompt, жауап нұсқалары options, дұрыс жауаптар және түсіндірмелер explanation) ТҮГЕЛДЕЙ САУАТТЫ ҚАЗАҚ ТІЛІНДЕ болуы тиіс.`;
+}
+
+function getQualityVerificationBlock(contentLang: ContentLang): string {
+  const langCheck =
+    contentLang === "ru"
+      ? "безупречную русскую орфографию, пунктуацию и грамматическое согласование"
+      : contentLang === "en"
+        ? "flawless English grammar, spelling, collocations, and punctuation"
+        : "мінсіз қазақ орфографиясын, үндестік заңын, тыныс белгілерін және стильдік нормаларын";
+  return [
+    `ОБЯЗАТЕЛЬНАЯ ВНУТРЕННЯЯ ПРОВЕРКА КАЧЕСТВА ПЕРЕД ОТВЕТОМ:`,
+    `1. Факты и вычисления: перепроверь каждую дату, формулу, единицу измерения, химическое уравнение и арифметический расчёт.`,
+    `2. Язык и грамотность: проверь ${langCheck} во всех вопросах и вариантах ответов.`,
+    `3. Однозначность теста (mcq): у каждого вопроса формата "mcq" должно быть ровно 4 разных правдоподобных варианта ответа и РОВНО ОДИН бесспорно правильный вариант (correctAnswer строго "0", "1", "2" или "3").`,
+    `4. Никаких повторов: каждый из 10 вопросов должен проверять отдельный аспект темы и не повторять ранее заданные вопросы.`,
+  ].join("\n");
+}
+
+interface StoredDiagnosticSession {
+  subjectId: string;
+  targetGrade: number;
+  contentLang: ContentLang;
+  questions: DiagnosticQuestion[];
+  createdAt: number;
+}
+
+const diagnosticSessions = new Map<string, StoredDiagnosticSession>();
+
+function pruneDiagnosticSessions() {
+  const cutoff = Date.now() - 3 * 60 * 60 * 1000;
+  for (const [id, sess] of diagnosticSessions.entries()) {
+    if (sess.createdAt < cutoff) {
+      diagnosticSessions.delete(id);
+    }
+  }
+  if (diagnosticSessions.size > 400) {
+    const oldest = Array.from(diagnosticSessions.entries())
+      .sort((a, b) => a[1].createdAt - b[1].createdAt)
+      .slice(0, diagnosticSessions.size - 300);
+    for (const [id] of oldest) {
+      diagnosticSessions.delete(id);
+    }
+  }
+}
+
+function signDiagnosticSession(session: StoredDiagnosticSession): string {
+  const compact = {
+    subjectId: session.subjectId,
+    targetGrade: session.targetGrade,
+    contentLang: session.contentLang,
+    createdAt: session.createdAt,
+    questions: session.questions.map((q) => ({
+      id: q.id,
+      goalCode: q.goalCode,
+      goalLabel: q.goalLabel,
+      options: q.options,
+      correctAnswer: q.correctAnswer,
+      explanation: q.explanation,
+    })),
+  };
+  const payload = Buffer.from(JSON.stringify(compact), "utf8").toString("base64url");
+  const sig = crypto
+    .createHmac("sha256", DIAGNOSTIC_SIGNING_KEY)
+    .update(payload)
+    .digest("base64url");
+  return `${payload}.${sig}`;
+}
+
+function verifyDiagnosticToken(
+  token: string
+): StoredDiagnosticSession | null {
+  try {
+    const dotIdx = token.indexOf(".");
+    if (dotIdx <= 0) return null;
+    const payload = token.slice(0, dotIdx);
+    const sig = token.slice(dotIdx + 1);
+    const expected = crypto
+      .createHmac("sha256", DIAGNOSTIC_SIGNING_KEY)
+      .update(payload)
+      .digest("base64url");
+    if (sig.length !== expected.length) return null;
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+      return null;
+    }
+    const decoded = JSON.parse(
+      Buffer.from(payload, "base64url").toString("utf8")
+    ) as StoredDiagnosticSession;
+    if (!decoded || !Array.isArray(decoded.questions)) return null;
+    if (Date.now() - Number(decoded.createdAt || 0) > 6 * 60 * 60 * 1000) {
+      return null;
+    }
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+function makeLocalizedText(text: string, contentLang: ContentLang) {
+  return {
+    kk: text,
+    ru: text,
+    ...(contentLang === "en" ? { en: text } : {}),
+  };
 }
 
 async function startServer() {
@@ -680,12 +855,344 @@ async function startServer() {
 
   // --- DIAGNOSTICS ---
   app.post(
+    "/api/diagnostics/generate",
+    optionalAuth,
+    rateLimit(25, 60_000),
+    async (req: AuthedRequest, res: Response) => {
+      const authUser = req.authUser;
+      const body = req.body as {
+        subjectId?: unknown;
+        targetGrade?: unknown;
+        scope?: unknown;
+        difficulty?: unknown;
+        interfaceLang?: unknown;
+        schoolLang?: unknown;
+        profile?: unknown;
+        weakTopics?: unknown;
+        previousQuestions?: unknown;
+      };
+
+      const interfaceLang: Lang = authUser
+        ? authUser.interfaceLang
+        : body.interfaceLang === "kk"
+          ? "kk"
+          : "ru";
+      const schoolLang: Lang = authUser
+        ? authUser.schoolLang
+        : body.schoolLang === "kk"
+          ? "kk"
+          : "ru";
+      const subjectId =
+        typeof body.subjectId === "string" ? body.subjectId : "math";
+      const targetGrade = Math.min(
+        11,
+        Math.max(1, Number(body.targetGrade) || authUser?.grade || 7)
+      );
+      const profile: StudyProfile =
+        targetGrade < 10
+          ? "general"
+          : authUser
+            ? authUser.profile
+            : body.profile === "humanitarian" || body.profile === "physmath"
+              ? body.profile
+              : "general";
+      const scope =
+        body.scope === "section" ||
+        body.scope === "topic" ||
+        body.scope === "previous_grade"
+          ? body.scope
+          : "subject";
+      const difficulty: DifficultyLevel =
+        body.difficulty === "basic" || body.difficulty === "advanced"
+          ? body.difficulty
+          : "medium";
+
+      const weakTopics = Array.isArray(body.weakTopics)
+        ? body.weakTopics
+            .filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+            .map((s) => s.trim().slice(0, 140))
+            .slice(0, 8)
+        : [];
+      const previousQuestions = Array.isArray(body.previousQuestions)
+        ? body.previousQuestions
+            .filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+            .map((s) => s.trim().slice(0, 180))
+            .slice(0, 25)
+        : [];
+
+      const ai = getGeminiClient();
+      if (!ai) {
+        res.status(503).json({
+          error:
+            interfaceLang === "kk"
+              ? "AI API қосылмаған (GEMINI_API_KEY орнатылмаған). Settings → Secrets бөлімінде кілтті қосыңыз."
+              : "AI API не подключён (не настроен GEMINI_API_KEY). Добавьте ключ в Settings → Secrets.",
+        });
+        return;
+      }
+
+      const contentLang = resolveSubjectContentLang(subjectId, schoolLang);
+      const subjectObj = getSubjectById(subjectId);
+      const subjectName = subjectObj
+        ? subjectObj.name[contentLang === "kk" ? "kk" : "ru"]
+        : subjectId;
+      const curriculumSummary = getCurriculumSummaryForPrompt(
+        subjectId,
+        targetGrade,
+        profile,
+        contentLang
+      );
+
+      const difficultyDesc =
+        difficulty === "basic"
+          ? "базовый (уверенное освоение стандарта класса)"
+          : difficulty === "advanced"
+            ? "повышенный (углублённый / олимпиадный / сложный уровень ЕНТ)"
+            : "средний (основной уровень контрольной работы по программе класса)";
+
+      const scopeDesc =
+        scope === "previous_grade"
+          ? `проверка фундаментальных знаний предыдущего (${Math.max(1, targetGrade - 1)}) и текущего (${targetGrade}) классов`
+          : scope === "section"
+            ? "углублённая проверка ключевого раздела курса"
+            : scope === "topic"
+              ? "прицельная проверка сложных тем программы"
+              : "комплексная диагностика по всему курсу предмета за данный класс";
+
+      interface RawGeneratedQuestion {
+        goalCode?: string;
+        goalLabel?: string;
+        format?: string;
+        passage?: string;
+        prompt?: string;
+        options?: string[];
+        correctAnswer?: string;
+        explanation?: string;
+      }
+
+      const generateBatch = async (
+        neededCount: number,
+        excludePrompts: string[]
+      ): Promise<DiagnosticQuestion[]> => {
+        const promptLines = [
+          `Сгенерируй РОВНО ${neededCount} уникальных диагностических вопросов ИСКЛЮЧИТЕЛЬНО по Типовой учебной программе (ГОСО) Республики Казахстан для ${targetGrade} класса.`,
+          `Предмет: «${subjectName}» (id: ${subjectId}).`,
+          `Класс: ${targetGrade} класс (направление: ${profile}).`,
+          `Режим диагностики: ${scopeDesc}.`,
+          `Уровень сложности: ${difficultyDesc}.`,
+          curriculumSummary
+            ? `Официальные ориентиры программы ГОСО РК для ${targetGrade} класса:\n${curriculumSummary}`
+            : "",
+          weakTopics.length > 0
+            ? `ИНДИВИДУАЛЬНАЯ АДАПТАЦИЯ ПОД ПРОБЕЛЫ УЧЕНИКА (в рамках программы ${targetGrade} класса): обязательно включи вопросы (около половины теста) по этим слабым темам ученика: ${weakTopics.join("; ")}. Остальные вопросы распредели по другим важным темам ${targetGrade} класса.`
+            : `Распредели вопросы по разным темам и разделам программы ${targetGrade} класса.`,
+          excludePrompts.length > 0
+            ? `НЕ ПОВТОРЯЙ И НЕ ПЕРЕФРАЗИРУЙ эти уже заданные вопросы:\n- ${excludePrompts.join("\n- ")}`
+            : "",
+          getStrictLanguageDirective(contentLang),
+          getGradeRigorGuidance(targetGrade),
+          getQualityVerificationBlock(contentLang),
+          `ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ К ФОРМАТУ:`,
+          `- В массиве "questions" должно быть РОВНО ${neededCount} элементов.`,
+          `- Используй преимущественно формат "mcq" (минимум ${Math.max(1, neededCount - 2)} вопросов "mcq" и при необходимости до 2 вопросов "calculation" или "short_answer" с единственным точным ответом).`,
+          `- Для каждого "mcq": поле "options" обязано содержать РОВНО 4 непустых варианта ответа, а поле "correctAnswer" обязано быть строкой "0", "1", "2" или "3" (индекс правильного варианта в массиве options).`,
+          `- Поле "goalCode" — код цели обучения строго этого класса (например "${targetGrade}.1.2.1"), "goalLabel" — понятное название темы программы ${targetGrade} класса строго на языке предмета.`,
+        ]
+          .filter(Boolean)
+          .join("\n\n");
+
+        const resp = await generateContentSmart(ai, {
+          contents: promptLines,
+          config: {
+            systemInstruction: `${getStrictLanguageDirective(contentLang)}\n${getGradeRigorGuidance(targetGrade)}\n${getQualityVerificationBlock(contentLang)}`,
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                questions: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      goalCode: { type: Type.STRING },
+                      goalLabel: { type: Type.STRING },
+                      format: { type: Type.STRING },
+                      passage: { type: Type.STRING },
+                      prompt: { type: Type.STRING },
+                      options: {
+                        type: Type.ARRAY,
+                        items: { type: Type.STRING },
+                      },
+                      correctAnswer: { type: Type.STRING },
+                      explanation: { type: Type.STRING },
+                    },
+                    required: [
+                      "goalCode",
+                      "goalLabel",
+                      "format",
+                      "prompt",
+                      "correctAnswer",
+                      "explanation",
+                    ],
+                  },
+                },
+              },
+              required: ["questions"],
+            },
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          },
+        });
+
+        const parsed = JSON.parse((resp.text ?? "{}").trim()) as {
+          questions?: RawGeneratedQuestion[];
+        };
+        const rawList = Array.isArray(parsed.questions) ? parsed.questions : [];
+        const normalized: DiagnosticQuestion[] = [];
+        const seenPrompts = new Set(
+          excludePrompts.map((p) => p.toLowerCase().trim())
+        );
+
+        for (const item of rawList) {
+          const promptText = String(item.prompt ?? "").trim();
+          const goalLabelText = String(item.goalLabel ?? "").trim();
+          const explanationText = String(item.explanation ?? "").trim();
+          if (!promptText || !goalLabelText) continue;
+
+          const dedupeKey = promptText.toLowerCase();
+          if (seenPrompts.has(dedupeKey)) continue;
+
+          const cleanOptions = Array.isArray(item.options)
+            ? item.options.map((o) => String(o ?? "").trim()).filter(Boolean)
+            : [];
+
+          let fmt: QuestionFormat =
+            item.format === "calculation" || item.format === "short_answer"
+              ? item.format
+              : "mcq";
+
+          let correct = String(item.correctAnswer ?? "").trim();
+          if (fmt === "mcq" || cleanOptions.length >= 4) {
+            if (cleanOptions.length < 4) continue;
+            fmt = "mcq";
+            const idxNum = Number(correct);
+            if (!Number.isInteger(idxNum) || idxNum < 0 || idxNum >= 4) {
+              const matchedIdx = cleanOptions.findIndex(
+                (opt) => normalizeAnswer(opt) === normalizeAnswer(correct)
+              );
+              if (matchedIdx === -1) continue;
+              correct = String(matchedIdx);
+            } else {
+              correct = String(idxNum);
+            }
+          } else if (!correct) {
+            continue;
+          }
+
+          seenPrompts.add(dedupeKey);
+          const passageText = String(item.passage ?? "").trim();
+          normalized.push({
+            id: crypto.randomUUID(),
+            subjectId,
+            grade: targetGrade,
+            difficulty,
+            format: fmt,
+            goalCode: String(item.goalCode ?? `${targetGrade}.1`).trim().slice(0, 24),
+            goalLabel: makeLocalizedText(goalLabelText, contentLang),
+            prompt: makeLocalizedText(promptText, contentLang),
+            ...(passageText
+              ? { passage: makeLocalizedText(passageText, contentLang) }
+              : {}),
+            ...(fmt === "mcq"
+              ? {
+                  options: cleanOptions
+                    .slice(0, 4)
+                    .map((opt) => makeLocalizedText(opt, contentLang)),
+                }
+              : {}),
+            correctAnswer: correct,
+            explanation: makeLocalizedText(
+              explanationText || correct,
+              contentLang
+            ),
+            variantGroup: 1,
+          });
+        }
+        return normalized;
+      };
+
+      try {
+        const collected = await generateBatch(10, previousQuestions);
+        if (collected.length < 10) {
+          const extra = await generateBatch(10 - collected.length, [
+            ...previousQuestions,
+            ...collected.map((q) => pickLocalizedText(q.prompt, contentLang)),
+          ]);
+          for (const q of extra) {
+            if (collected.length >= 10) break;
+            collected.push(q);
+          }
+        }
+
+        const finalQuestions = collected.slice(0, 10);
+        if (finalQuestions.length === 0) {
+          res.status(502).json({
+            error: "AI не смог сформировать корректные задания. Повторите попытку.",
+          });
+          return;
+        }
+
+        pruneDiagnosticSessions();
+        const diagnosticSessionId = crypto.randomUUID();
+        const sessionData: StoredDiagnosticSession = {
+          subjectId,
+          targetGrade,
+          contentLang,
+          questions: finalQuestions,
+          createdAt: Date.now(),
+        };
+        diagnosticSessions.set(diagnosticSessionId, sessionData);
+        const diagnosticToken = signDiagnosticSession(sessionData);
+
+        const clientQuestions: ClientDiagnosticQuestion[] = finalQuestions.map(
+          (q) => ({
+            id: q.id,
+            subjectId: q.subjectId,
+            grade: q.grade,
+            difficulty: q.difficulty,
+            format: q.format,
+            goalCode: q.goalCode,
+            goalLabel: q.goalLabel,
+            prompt: q.prompt,
+            passage: q.passage,
+            options: q.options,
+          })
+        );
+
+        res.json({
+          diagnosticSessionId,
+          diagnosticToken,
+          contentLang,
+          questions: clientQuestions,
+        });
+      } catch (err) {
+        const formatted = formatGeminiError(err);
+        res.status(formatted.status).json({
+          error: formatted.message,
+          detail: formatted.detail,
+        });
+      }
+    }
+  );
+
+  app.post(
     "/api/diagnostics/submit",
     optionalAuth,
     rateLimit(25, 60_000),
     async (req: AuthedRequest, res: Response) => {
       const authUser = req.authUser;
       const body = req.body as {
+        diagnosticSessionId?: unknown;
+        diagnosticToken?: unknown;
         subjectId?: unknown;
         targetGrade?: unknown;
         scope?: unknown;
@@ -698,6 +1205,11 @@ async function startServer() {
       const interfaceLang: Lang = authUser
         ? authUser.interfaceLang
         : body.interfaceLang === "kk"
+          ? "kk"
+          : "ru";
+      const schoolLang: Lang = authUser
+        ? authUser.schoolLang
+        : body.schoolLang === "kk"
           ? "kk"
           : "ru";
       const subjectId = typeof body.subjectId === "string" ? body.subjectId : "math";
@@ -720,13 +1232,41 @@ async function startServer() {
           ? (body.answers as Record<string, string>)
           : {};
 
+      const sessionId =
+        typeof body.diagnosticSessionId === "string"
+          ? body.diagnosticSessionId
+          : "";
+      const tokenStr =
+        typeof body.diagnosticToken === "string" ? body.diagnosticToken : "";
+
+      const storedSession =
+        (sessionId ? diagnosticSessions.get(sessionId) : undefined) ??
+        (tokenStr ? verifyDiagnosticToken(tokenStr) : null);
+
       const questionIds = Object.keys(answers);
-      const questions = DIAGNOSTIC_QUESTIONS.filter((q) =>
-        questionIds.includes(q.id)
-      );
+      const contentLang: ContentLang =
+        storedSession?.contentLang ??
+        resolveSubjectContentLang(subjectId, schoolLang);
+
+      const questions = storedSession
+        ? storedSession.questions
+        : DIAGNOSTIC_QUESTIONS.filter((q) => questionIds.includes(q.id));
 
       if (questions.length === 0) {
-        res.status(400).json({ error: "Ответьте хотя бы на один вопрос диагностики." });
+        res.status(400).json({
+          error:
+            "Сессия диагностики не найдена или истекла. Нажмите «Начать диагностику заново».",
+        });
+        return;
+      }
+
+      const hasAnyAnswer = questions.some(
+        (q) => normalizeAnswer(String(answers[q.id] ?? "")).length > 0
+      );
+      if (!hasAnyAnswer) {
+        res.status(400).json({
+          error: "Ответьте хотя бы на один вопрос диагностики.",
+        });
         return;
       }
 
@@ -749,25 +1289,25 @@ async function startServer() {
         const isCorrect = userAns.length > 0 && userAns === expected;
         if (isCorrect) correctCount += 1;
 
-        const goalLabel = q.goalLabel[interfaceLang];
-        const prev = goalGroups.get(q.goalCode) ?? {
+        const goalLabel = pickLocalizedText(q.goalLabel, contentLang);
+        const prev = goalGroups.get(q.goalCode || goalLabel) ?? {
           label: goalLabel,
           correct: 0,
           total: 0,
         };
         prev.total += 1;
         if (isCorrect) prev.correct += 1;
-        goalGroups.set(q.goalCode, prev);
+        goalGroups.set(q.goalCode || goalLabel, prev);
 
         reviewDetails.push({
           questionId: q.id,
           isCorrect,
           correctAnswer:
             q.options && !Number.isNaN(Number(q.correctAnswer))
-              ? q.options[Number(q.correctAnswer)]?.[interfaceLang] ??
+              ? pickLocalizedText(q.options[Number(q.correctAnswer)], contentLang) ||
                 q.correctAnswer
               : q.correctAnswer,
-          explanation: q.explanation[interfaceLang],
+          explanation: pickLocalizedText(q.explanation, contentLang),
         });
       }
 
@@ -788,7 +1328,7 @@ async function startServer() {
       const percentage = Math.round((correctCount / questions.length) * 100);
       const subjectObj = getSubjectById(subjectId);
       const subjectName = subjectObj
-        ? subjectObj.name[interfaceLang]
+        ? subjectObj.name[contentLang === "kk" ? "kk" : "ru"]
         : subjectId;
 
       const weakLabels = breakdown
@@ -799,13 +1339,20 @@ async function startServer() {
       const ai = getGeminiClient();
       if (ai) {
         try {
-          const langPrompt =
-            interfaceLang === "kk" ? "Қазақ тілінде" : "На русском языке";
+          const planLanguageInstruction =
+            contentLang === "en"
+              ? "Write the entire 4-step learning plan strictly in clear English."
+              : contentLang === "kk"
+                ? "Бүкіл 4 қадамдық оқу жоспарын таза сауатты қазақ тілінде жаз."
+                : "Напиши весь персональный план обучения из 4 шагов строго на грамотном русском языке.";
           const planResp = await generateContentSmart(ai, {
-            contents: `${langPrompt}. Создай персональный план обучения из 4 шагов для ученика ${targetGrade} класса по предмету «${subjectName}». Процент выполнения диагностики: ${percentage}%. Слабые темы: ${
-              weakLabels.length > 0 ? weakLabels.join(", ") : "нет критических пробелов, можно углубить знания"
-            }. Пиши доброжелательно, поддерживающе, без сравнений с другими учениками. Включи: 1) объяснение слабой темы простыми словами, 2) короткий пример, 3) 2 тренировочных упражнения, 4) совет перед повторной диагностикой.`,
+            contents: `${planLanguageInstruction} Создай персональный план обучения из 4 шагов для ученика ${targetGrade} класса по предмету «${subjectName}». Процент выполнения диагностики: ${percentage}%. Слабые темы: ${
+              weakLabels.length > 0
+                ? weakLabels.join(", ")
+                : "критических пробелов нет, можно перейти к углублённым заданиям"
+            }. Пиши доброжелательно, строго в рамках программы ${targetGrade} класса (без примитивных советов начальной школы). Включи: 1) объяснение слабой темы на уровне ${targetGrade} класса, 2) разбор показательного примера, 3) 2 тренировочных задания по уровню ${targetGrade} класса, 4) рекомендацию перед следующей диагностикой.`,
             config: {
+              systemInstruction: `${getStrictLanguageDirective(contentLang)}\n${getGradeRigorGuidance(targetGrade)}`,
               thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
             },
           });
@@ -818,15 +1365,18 @@ async function startServer() {
 
       if (!learningPlan) {
         learningPlan =
-          interfaceLang === "kk"
-            ? "AI API қосылмағандықтан немесе уақытша қолжетімсіз болғандықтан, дербес оқу жоспарын жасау үшін Settings → Secrets бөлімінде GEMINI_API_KEY тексеріңіз. Қазір төмендегі қателерді талдап, «AI мұғалім» бөлімінде тақырыпты қайталай аласыз."
-            : "Персональный ИИ-план временно недоступен (проверьте GEMINI_API_KEY в Settings → Secrets). Вы можете разобрать ошибки ниже и повторить темы в разделе «AI-учитель».";
+          contentLang === "en"
+            ? "Personalized AI plan is temporarily unavailable. Review the explanations below and practice the flagged topics in the AI Tutor tab."
+            : contentLang === "kk"
+              ? "Дербес AI оқу жоспары уақытша қолжетімсіз. Төмендегі қателерді талдап, «AI мұғалім» бөлімінде әлсіз тақырыптарды бекіте аласыз."
+              : "Персональный ИИ-план временно недоступен. Изучите разбор ошибок ниже и закрепите слабые темы в разделе «AI-учитель».";
       }
 
       const attempt: DiagnosticAttempt = {
         id: crypto.randomUUID(),
         subjectId,
         subjectName,
+        contentLang,
         targetGrade,
         scope,
         difficulty,
@@ -878,6 +1428,7 @@ async function startServer() {
         topicTitle?: unknown;
         message?: unknown;
         history?: unknown;
+        weakTopics?: unknown;
       };
 
       const interfaceLang: Lang = authUser
@@ -920,12 +1471,25 @@ async function startServer() {
               : "general";
       const topicTitle =
         typeof body.topicTitle === "string" ? body.topicTitle.trim() : "";
+      const weakTopics = Array.isArray(body.weakTopics)
+        ? body.weakTopics
+            .filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+            .map((s) => s.trim().slice(0, 140))
+            .slice(0, 8)
+        : [];
+      const contentLang = resolveSubjectContentLang(subjectId, schoolLang);
       const subjectObj = getSubjectById(subjectId);
       const validGradeSubjects = getSubjectsForGrade(grade);
       const allowedSubject = validGradeSubjects.find((s) => s.id === subjectId);
       const subjectName = allowedSubject
-        ? allowedSubject.name[schoolLang]
-        : subjectObj?.name[schoolLang] ?? subjectId;
+        ? allowedSubject.name[contentLang === "kk" ? "kk" : "ru"]
+        : subjectObj?.name[contentLang === "kk" ? "kk" : "ru"] ?? subjectId;
+      const curriculumSummary = getCurriculumSummaryForPrompt(
+        subjectId,
+        grade,
+        profile,
+        contentLang
+      );
 
       const ws = authUser ? getUserWorkspace(authUser.id) : null;
       const existingThread =
@@ -950,24 +1514,41 @@ async function startServer() {
         ? existingThread.messages.slice(-10)
         : guestHistory;
 
+      const subjectLanguageInstruction =
+        contentLang === "ru" && (subjectId === "russian_lang" || subjectId === "russian_lit")
+          ? `Языковое правило: предмет «${subjectName}» преподаётся строго на русском языке — все правила, примеры, формулировки заданий, термины тем и разборы пиши на безупречном русском языке.`
+          : contentLang === "en"
+            ? `Language rule: for English subject, formulate all examples, grammar terms, practice sentences, and exercises strictly in natural English (${grade} grade level); you may give concise guidance notes in ${interfaceLang === "kk" ? "Kazakh" : "Russian"} only if helpful, keeping all English practice strictly in English.`
+            : contentLang === "kk" && (subjectId === "kazakh_lang" || subjectId === "kazakh_lit" || subjectId === "alippe")
+              ? `Тілдік ереже: «${subjectName}» пәні бойынша барлық ережелер, мысалдар мен тапсырмалар таза қазақ тілінде жазылады.`
+              : `Отвечай на языке: ${interfaceLang === "kk" ? "Қазақ тілі" : "Русский язык"} (с учётом терминологии языка обучения: ${schoolLang === "kk" ? "казахский" : "русский"}).`;
+
       const systemInstruction = [
-        `Ты — AI Ұстаз, доброжелательный, терпеливый и грамотный цифровой учитель для школьников Казахстана.`,
-        `Отвечай на языке интерфейса пользователя: ${
-          interfaceLang === "kk" ? "Қазақ тілі" : "Русский язык"
+        `Ты — AI Ұстаз, доброжелательный, терпеливый и высококвалифицированный цифровой учитель для школьников Казахстана.`,
+        subjectLanguageInstruction,
+        `Контекст ученика: ${grade} класс, направление — ${profile}, предмет — «${subjectName}»${
+          topicTitle ? `, текущая тема — «${topicTitle}»` : ""
         }.`,
-        `Контекст ученика: ${grade} класс, язык обучения школы — ${
-          schoolLang === "kk" ? "казахский" : "русский"
-        }, направление — ${profile}, предмет — «${subjectName}»${
-          topicTitle ? `, тема — «${topicTitle}»` : ""
-        }.`,
-        `Академическая честность и педагогика:`,
-        `- Адаптируй сложность объяснений строго под возраст ученика ${grade} класса.`,
-        `- Не используй сложные термины без простого пояснения и примера.`,
+        curriculumSummary
+          ? `Программа ${grade} класса по этому предмету:\n${curriculumSummary}`
+          : "",
+        weakTopics.length > 0
+          ? `Индивидуальный профиль ученика — слабые темы из прошлых диагностик: ${weakTopics.join(
+              "; "
+            )}. Учитывай эти пробелы в объяснениях и не повторяй однотипные примеры.`
+          : "",
+        getGradeRigorGuidance(grade),
+        `Академическая честность, проверка фактов и педагогика (строго по ГОСО РК для ${grade} класса):`,
+        `- ПЕРЕД ОТВЕТОМ проверь все факты, даты, формулы, расчёты и безупречную грамотность текста.`,
+        `- Строго соблюдай границы программы ${grade} класса Казахстана: не упрощай задания для 5–11 классов до уровня начальной школы и не перегружай младшие классы сложными терминами и темами старших классов.`,
+        `- Формулируй объяснения и тренировочные задания языком, точно соответствующим возрасту ученика ${grade} класса.`,
         `- По математическим, физическим и химическим задачам показывай пошаговый ход решения и проверку результата.`,
-        `- Если ученик просит просто готовое списанное решение, помоги разобраться в принципе и предложи 1 похожее тренировочное задание.`,
+        `- Если ученик просит готовое списанное решение, объясни принцип и предложи 1 новое тренировочное задание строго по программе ${grade} класса.`,
         `- Никогда не выдумывай несуществующие приказы, номера официальных тем или фальшивые факты. Если не уверен — честно скажи об этом.`,
         `- Соблюдай безопасность несовершеннолетних: никаких опасных рекомендаций.`,
-      ].join("\n");
+      ]
+        .filter(Boolean)
+        .join("\n");
 
       const conversationText = historyMessages
         .map((m) => `${m.role === "user" ? "Ученик" : "AI Ұстаз"}: ${m.content.slice(0, 2000)}`)

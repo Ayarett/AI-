@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type {
   CharacterGender,
   CharacterOutfit,
@@ -46,14 +46,40 @@ export function SettingsView({
 
   const stageInfo = getSchoolStageInfo(grade);
 
+  const isDefaultGuestLabel = (val: string) => {
+    const trimmed = val.trim();
+    return (
+      trimmed === '' ||
+      trimmed === 'Қонақ / Гость' ||
+      trimmed === 'Қонақ' ||
+      trimmed === 'Гость'
+    );
+  };
+
+  useEffect(() => {
+    setInterfaceLang(user.interfaceLang);
+    setDisplayName((prev) =>
+      isGuest && isDefaultGuestLabel(prev)
+        ? user.interfaceLang === 'kk'
+          ? 'Қонақ'
+          : 'Гость'
+        : user.displayName
+    );
+  }, [user.interfaceLang, user.displayName, isGuest]);
+
   const handleSave = async () => {
     setSaving(true);
     setSavedNotice(false);
     try {
       if (isGuest) {
+        const nextGuestName = isDefaultGuestLabel(displayName)
+          ? interfaceLang === 'kk'
+            ? 'Қонақ'
+            : 'Гость'
+          : displayName.trim();
         onUserUpdated({
           ...user,
-          displayName: displayName.trim() || user.displayName,
+          displayName: nextGuestName,
           interfaceLang,
           schoolLang,
           grade,
@@ -123,7 +149,13 @@ export function SettingsView({
               </label>
               <select
                 value={interfaceLang}
-                onChange={(e) => setInterfaceLang(e.target.value as Lang)}
+                onChange={(e) => {
+                  const nextLang = e.target.value as Lang;
+                  setInterfaceLang(nextLang);
+                  if (isGuest && isDefaultGuestLabel(displayName)) {
+                    setDisplayName(nextLang === 'kk' ? 'Қонақ' : 'Гость');
+                  }
+                }}
                 className="w-full px-3.5 py-2 text-sm rounded-xl border border-slate-300 dark:border-zinc-700 bg-white dark:bg-zinc-950"
               >
                 <option value="kk">Қазақша</option>

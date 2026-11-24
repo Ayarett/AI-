@@ -86,7 +86,7 @@ const GUEST_WORKSPACE_KEY = 'ai_ustaz_guest_workspace_v1';
 const DEFAULT_GUEST_PROFILE: UserProfile = {
   id: 'guest',
   username: 'guest',
-  displayName: 'Қонақ / Гость',
+  displayName: 'Гость',
   role: 'student',
   interfaceLang: 'ru',
   schoolLang: 'ru',
@@ -99,16 +99,42 @@ const DEFAULT_GUEST_PROFILE: UserProfile = {
   createdAt: '2026-09-01T00:00:00.000Z',
 };
 
+function isDefaultGuestDisplayName(name: string | undefined): boolean {
+  if (!name) return true;
+  const trimmed = name.trim();
+  return (
+    trimmed === '' ||
+    trimmed === 'Қонақ / Гость' ||
+    trimmed === 'Қонақ' ||
+    trimmed === 'Гость'
+  );
+}
+
+function getResolvedDisplayName(profile: UserProfile, lang: Lang): string {
+  if (profile.id === 'guest' && isDefaultGuestDisplayName(profile.displayName)) {
+    return lang === 'kk' ? 'Қонақ' : 'Гость';
+  }
+  return profile.displayName;
+}
+
 function loadGuestProfile(): UserProfile {
   try {
     const raw = localStorage.getItem(GUEST_PROFILE_KEY);
     if (!raw) return DEFAULT_GUEST_PROFILE;
     const parsed = JSON.parse(raw) as Partial<UserProfile>;
+    const resolvedInterfaceLang: Lang = parsed.interfaceLang === 'kk' ? 'kk' : 'ru';
+    const resolvedDisplayName = isDefaultGuestDisplayName(parsed.displayName)
+      ? resolvedInterfaceLang === 'kk'
+        ? 'Қонақ'
+        : 'Гость'
+      : String(parsed.displayName);
     return {
       ...DEFAULT_GUEST_PROFILE,
       ...parsed,
       id: 'guest',
       username: 'guest',
+      interfaceLang: resolvedInterfaceLang,
+      displayName: resolvedDisplayName,
       grade: Math.min(11, Math.max(1, Number(parsed.grade) || 7)),
       profile:
         (Number(parsed.grade) || 7) < 10
@@ -382,11 +408,15 @@ export default function App() {
   }
 
   const isGuest = !user;
-  const activeUser = user ?? guestProfile;
+  const rawActiveUser = user ?? guestProfile;
+  const lang = rawActiveUser.interfaceLang;
+  const activeUser: UserProfile = {
+    ...rawActiveUser,
+    displayName: getResolvedDisplayName(rawActiveUser, lang),
+  };
   const activeWorkspace = user ? workspace : guestWorkspace;
   const updateActiveWorkspace = user ? setWorkspace : setGuestWorkspace;
 
-  const lang = activeUser.interfaceLang;
   const isTeacher = activeUser.role === 'teacher';
   const gradeSubjects = getSubjectsForGrade(activeUser.grade);
   const stageInfo = getSchoolStageInfo(activeUser.grade);
@@ -610,6 +640,11 @@ export default function App() {
                   setGuestProfile((prev) => ({
                     ...prev,
                     interfaceLang: nextLang,
+                    displayName: isDefaultGuestDisplayName(prev.displayName)
+                      ? nextLang === 'kk'
+                        ? 'Қонақ'
+                        : 'Гость'
+                      : prev.displayName,
                   }));
                   return;
                 }
@@ -888,6 +923,7 @@ export default function App() {
 
           {!isTeacher && studentTab === 'tutor' && (
             <AiTutorView
+              profileKey={activeUser.id}
               interfaceLang={lang}
               schoolLang={activeUser.schoolLang}
               userGrade={activeUser.grade}
@@ -908,6 +944,7 @@ export default function App() {
 
           {!isTeacher && studentTab === 'diagnostics' && (
             <DiagnosticsView
+              profileKey={activeUser.id}
               interfaceLang={lang}
               schoolLang={activeUser.schoolLang}
               userGrade={activeUser.grade}

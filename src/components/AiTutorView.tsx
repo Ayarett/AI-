@@ -9,12 +9,14 @@ import type {
   Lang,
   StudyProfile,
 } from '../types/platform';
-import { getSubjectsForGrade } from '../data/curriculum';
+import { getSubjectsForGrade, resolveSubjectContentLang } from '../data/curriculum';
 import { t } from '../i18n/translations';
 import { apiFetch } from '../utils/apiClient';
+import { getStudentAdaptationContext } from '../utils/studentHistory';
 import { TeacherCharacter3D } from './TeacherCharacter3D';
 
 interface AiTutorViewProps {
+  profileKey?: string;
   interfaceLang: Lang;
   schoolLang: Lang;
   userGrade: number;
@@ -31,6 +33,7 @@ interface AiTutorViewProps {
 }
 
 export function AiTutorView({
+  profileKey = 'guest',
   interfaceLang,
   schoolLang,
   userGrade,
@@ -91,6 +94,7 @@ export function AiTutorView({
             content: m.content,
           }))
         : [];
+      const adaptation = getStudentAdaptationContext(profileKey, subjectId);
       const res = await apiFetch<{ thread: ChatThread; chatThreads: ChatThread[] }>(
         '/api/ai/tutor',
         {
@@ -105,6 +109,7 @@ export function AiTutorView({
             topicTitle,
             message: trimmed,
             history,
+            weakTopics: adaptation.weakTopics,
           }),
         }
       );
@@ -155,18 +160,25 @@ export function AiTutorView({
     setExpression('greeting');
   };
 
+  const tutorContentLang = resolveSubjectContentLang(subjectId, interfaceLang);
   const starterPrompts =
-    interfaceLang === 'kk'
+    tutorContentLang === 'en'
       ? [
-          'Осы тақырыпты қарапайым мысалмен түсіндірші',
-          'Маған 2 жаттығу тапсырмасын беріп, жауабымды тексерші',
-          'Осы есептің шешу жолын қадамдап көрсетші',
+          'Explain this grammar or vocabulary topic with clear B1/B2 examples',
+          'Give me 2 grade-appropriate practice exercises and check my answers',
+          'Show common mistakes students make on this topic and how to avoid them',
         ]
-      : [
-          'Объясни эту тему простыми словами с жизненным примером',
-          'Дай мне 2 тренировочных задания и проверь моё решение',
-          'Покажи пошаговый разбор типичной ошибки по этой теме',
-        ];
+      : tutorContentLang === 'kk'
+        ? [
+            'Осы тақырыпты сынып деңгейіне сай мысалдармен түсіндірші',
+            'Маған 2 жаттығу тапсырмасын беріп, жауабымды тексерші',
+            'Осы тақырыпта жиі кездесетін қателерді талдап көрсетші',
+          ]
+        : [
+            'Объясни эту тему строго по программе класса с яркими примерами',
+            'Дай мне 2 тренировочных задания моего класса и проверь моё решение',
+            'Покажи пошаговый разбор типичной ошибки по этой теме',
+          ];
 
   return (
     <div className="grid lg:grid-cols-12 gap-6 h-full">

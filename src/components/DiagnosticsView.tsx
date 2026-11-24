@@ -1,22 +1,31 @@
-import { useState } from 'react';
-import { CheckCircle2, RefreshCw, XCircle } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { CheckCircle2, Loader2, RefreshCw, Sparkles, XCircle } from 'lucide-react';
 import type {
   CharacterExpression,
   CharacterGender,
   CharacterOutfit,
+  ClientDiagnosticQuestion,
+  ContentLang,
   DiagnosticAttempt,
-  DiagnosticQuestion,
   DifficultyLevel,
   Lang,
   StudyProfile,
 } from '../types/platform';
-import { getSubjectsForGrade } from '../data/curriculum';
-import { selectDiagnosticQuestions } from '../data/diagnosticsBank';
+import {
+  getSubjectsForGrade,
+  pickLocalizedText,
+  resolveSubjectContentLang,
+} from '../data/curriculum';
 import { t } from '../i18n/translations';
 import { apiFetch } from '../utils/apiClient';
+import {
+  getStudentAdaptationContext,
+  recordDiagnosticResults,
+} from '../utils/studentHistory';
 import { TeacherCharacter3D } from './TeacherCharacter3D';
 
 interface DiagnosticsViewProps {
+  profileKey: string;
   interfaceLang: Lang;
   schoolLang: Lang;
   userGrade: number;
@@ -37,6 +46,7 @@ interface ReviewItem {
 }
 
 export function DiagnosticsView({
+  profileKey,
   interfaceLang,
   schoolLang,
   userGrade,
@@ -57,10 +67,15 @@ export function DiagnosticsView({
   );
   const [scope, setScope] = useState<'subject' | 'section' | 'topic' | 'previous_grade'>('subject');
   const [difficulty, setDifficulty] = useState<DifficultyLevel>('medium');
-  const [variantGroup, setVariantGroup] = useState<1 | 2>(1);
 
-  const [questions, setQuestions] = useState<DiagnosticQuestion[]>([]);
+  const [questions, setQuestions] = useState<ClientDiagnosticQuestion[]>([]);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionToken, setSessionToken] = useState<string | null>(null);
+  const [activeContentLang, setActiveContentLang] = useState<ContentLang>(
+    resolveSubjectContentLang(subjectId, schoolLang)
+  );
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [generating, setGenerating] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<{
@@ -68,20 +83,71 @@ export function DiagnosticsView({
     reviewDetails: ReviewItem[];
   } | null>(null);
   const [charExpr, setCharExpr] = useState<CharacterExpression>('idle');
+  const [historyVersion, setHistoryVersion] = useState(0);
 
-  const startTest = (group: 1 | 2 = variantGroup) => {
-    const picked = selectDiagnosticQuestions({
-      subjectId,
-      targetGrade,
-      difficulty,
-      variantGroup: group,
-      profile,
-    });
-    setQuestions(picked);
-    setAnswers({});
-    setResult(null);
+  useEffect(() => {
+    if (initialGrade) {
+      setTargetGrade(initialGrade);
+    }
+    if (initialSubjectId) {
+      setSubjectId(initialSubjectId);
+    }
+  }, [initialSubjectId, initialGrade]);
+
+  const adaptation = useMemo(
+    () => getStudentAdaptationContext(profileKey, subjectId),
+    [profileKey, subjectId, historyVersion]
+  );
+
+  const expectedContentLang = resolveSubjectContentLang(subjectId, schoolLang);
+
+  const startTest = async () => {
+    if (generating) return;
     setError(null);
-    setCharExpr('explaining');
+    setResult(null);
+    setGenerating(true);
+    setCharExpr('thinking');
+
+    try {
+      const latestAdaptation = getStudentAdaptationContext(profileKey, subjectId);
+      const res = await apiFetch<{
+        diagnosticSessionId: string;
+        diagnosticToken: string;
+        contentLang: ContentLang;
+        questions: ClientDiagnosticQuestion[];
+      }>('/api/diagnostics/generate', {
+        method: 'POST',
+        body: JSON.stringify({
+          subjectId,
+          targetGrade,
+          scope,
+          difficulty,
+          interfaceLang,
+          schoolLang,
+          profile,
+          weakTopics: latestAdaptation.weakTopics,
+          previousQuestions: latestAdaptation.previousQuestions,
+        }),
+      });
+
+      setSessionId(res.diagnosticSessionId);
+      setSessionToken(res.diagnosticToken);
+      setActiveContentLang(res.contentLang ?? expectedContentLang);
+      setQuestions(res.questions);
+      setAnswers({});
+      setCharExpr('explaining');
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : interfaceLang === 'kk'
+            ? 'Диагностика сұрақтарын жасау сәтсіз аяқталды.'
+            : 'Не удалось сгенерировать вопросы диагностики.'
+      );
+      setCharExpr('calm');
+    } finally {
+      setGenerating(false);
+    }
   };
 
   const handleSubmit = async () => {
@@ -96,6 +162,8 @@ export function DiagnosticsView({
       }>('/api/diagnostics/submit', {
         method: 'POST',
         body: JSON.stringify({
+          diagnosticSessionId: sessionId,
+          diagnosticToken: sessionToken,
           subjectId,
           targetGrade,
           scope,
@@ -105,6 +173,15 @@ export function DiagnosticsView({
           schoolLang,
         }),
       });
+
+      recordDiagnosticResults(profileKey, {
+        subjectId,
+        grade: targetGrade,
+        questions,
+        reviewDetails: res.reviewDetails,
+        contentLang: res.attempt.contentLang ?? activeContentLang,
+      });
+      setHistoryVersion((v) => v + 1);
       setResult({ attempt: res.attempt, reviewDetails: res.reviewDetails });
       onAttemptSaved(res.diagnostics);
       setCharExpr(res.attempt.percentage >= 70 ? 'happy' : 'calm');
@@ -116,10 +193,25 @@ export function DiagnosticsView({
     }
   };
 
-  const retryWithNewQuestions = () => {
-    const nextGroup: 1 | 2 = variantGroup === 1 ? 2 : 1;
-    setVariantGroup(nextGroup);
-    startTest(nextGroup);
+  const contentUiLabels = {
+    answerPlaceholder:
+      activeContentLang === 'en'
+        ? 'Type your answer...'
+        : activeContentLang === 'kk'
+          ? 'Жауабыңызды жазыңыз...'
+          : 'Введите ответ (слово или число)...',
+    correctLabel:
+      activeContentLang === 'en'
+        ? 'Correct answer'
+        : activeContentLang === 'kk'
+          ? 'Дұрыс жауап'
+          : 'Правильный ответ',
+    taskLabel:
+      activeContentLang === 'en'
+        ? 'Question'
+        : activeContentLang === 'kk'
+          ? 'Тапсырма'
+          : 'Задание',
   };
 
   return (
@@ -133,8 +225,8 @@ export function DiagnosticsView({
               </h1>
               <p className="text-sm text-slate-600 dark:text-zinc-400 mt-1">
                 {interfaceLang === 'kk'
-                  ? 'Алдын ала білім деңгейін анықтау: бұл мектеп бағасы емес, қай тақырыпты бекіту керегін көрсететін талдау.'
-                  : 'Предварительная оценка знаний по целям обучения: это не школьная отметка, а карта тем для уверенного роста.'}
+                  ? 'Әр іске қосқанда AI таңдалған сынып бағдарламасы мен сіздің әлсіз тақырыптарыңызға сай 10 жаңа тапсырма дайындайды.'
+                  : 'При каждом запуске ИИ формирует 10 уникальных заданий строго по программе выбранного класса с учётом ваших пробелов.'}
               </p>
             </div>
 
@@ -149,8 +241,7 @@ export function DiagnosticsView({
                     const nextScope = e.target.value as typeof scope;
                     setScope(nextScope);
                     if (nextScope === 'previous_grade' && userGrade > 1) {
-                      const prevG = userGrade - 1;
-                      setTargetGrade(prevG);
+                      setTargetGrade(userGrade - 1);
                     }
                   }}
                   className="w-full px-3 py-2 text-xs font-medium rounded-xl border border-slate-300 dark:border-zinc-700 bg-white dark:bg-zinc-950"
@@ -227,19 +318,66 @@ export function DiagnosticsView({
               </div>
             </div>
 
-            <button
-              type="button"
-              onClick={() => startTest(variantGroup)}
-              className="px-5 py-2.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl transition-colors cursor-pointer"
-            >
-              {questions.length > 0
-                ? interfaceLang === 'kk'
-                  ? 'Диагностиканы қайта бастау'
-                  : 'Начать диагностику заново'
-                : interfaceLang === 'kk'
-                  ? 'Диагностиканы бастау'
-                  : 'Начать диагностику'}
-            </button>
+            {adaptation.weakTopics.length > 0 && (
+              <div className="p-3.5 rounded-xl bg-amber-50/70 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-900/50 flex items-start gap-2.5 text-xs text-amber-900 dark:text-amber-200">
+                <Sparkles className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-semibold">
+                    {interfaceLang === 'kk'
+                      ? 'Дербес бейімделу белсенді:'
+                      : 'Индивидуальная адаптация включена:'}
+                  </span>{' '}
+                  {interfaceLang === 'kk'
+                    ? `Алдыңғы қателер бойынша басым тақырыптар: ${adaptation.weakTopics.slice(0, 3).join(', ')}.`
+                    : `В новом тесте приоритетно будут проверены ваши слабые темы: ${adaptation.weakTopics.slice(0, 3).join(', ')}.`}
+                </div>
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                disabled={generating}
+                onClick={() => void startTest()}
+                className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 rounded-xl transition-colors cursor-pointer"
+              >
+                {generating && <Loader2 className="w-4 h-4 animate-spin" />}
+                <span>
+                  {generating
+                    ? interfaceLang === 'kk'
+                      ? '10 тапсырма дайындалуда...'
+                      : 'Генерация 10 заданий...'
+                    : questions.length > 0
+                      ? interfaceLang === 'kk'
+                        ? 'Диагностиканы қайта бастау (жаңа 10 сұрақ)'
+                        : 'Начать заново (новые 10 вопросов)'
+                      : interfaceLang === 'kk'
+                        ? 'Диагностиканы бастау (10 сұрақ)'
+                        : 'Начать диагностику (10 вопросов)'}
+                </span>
+              </button>
+
+              <span className="text-xs text-slate-500 dark:text-zinc-400">
+                {expectedContentLang === 'ru'
+                  ? 'Язык теста: Русский'
+                  : expectedContentLang === 'en'
+                    ? 'Test language: English'
+                    : 'Тест тілі: Қазақша'}
+              </span>
+            </div>
+
+            {error && questions.length === 0 && (
+              <div className="p-3.5 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-xs text-red-700 dark:text-red-300 font-medium flex flex-wrap items-center justify-between gap-2">
+                <span>{error}</span>
+                <button
+                  type="button"
+                  onClick={() => void startTest()}
+                  className="px-3 py-1 rounded-lg bg-red-600 text-white hover:bg-red-700 cursor-pointer"
+                >
+                  {interfaceLang === 'kk' ? 'Қайталау' : 'Повторить'}
+                </button>
+              </div>
+            )}
           </div>
 
           {questions.length > 0 && !result && (
@@ -250,23 +388,24 @@ export function DiagnosticsView({
                   className="rounded-2xl bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 p-5 space-y-3"
                 >
                   <div className="flex items-center justify-between text-xs text-slate-500 dark:text-zinc-400">
-                    <span>
-                      {idx + 1} / {questions.length} · {q.goalLabel[interfaceLang]}
+                    <span className="font-medium">
+                      {idx + 1} / {questions.length} ·{' '}
+                      {pickLocalizedText(q.goalLabel, activeContentLang)}
                     </span>
                     <span>{q.format}</span>
                   </div>
 
                   {q.passage && (
-                    <p className="p-3 rounded-xl bg-slate-50 dark:bg-zinc-950 border border-slate-200 dark:border-zinc-800 text-xs text-slate-700 dark:text-zinc-300">
-                      {q.passage[interfaceLang]}
+                    <p className="p-3 rounded-xl bg-slate-50 dark:bg-zinc-950 border border-slate-200 dark:border-zinc-800 text-xs text-slate-700 dark:text-zinc-300 leading-relaxed">
+                      {pickLocalizedText(q.passage, activeContentLang)}
                     </p>
                   )}
 
-                  <p className="text-sm font-semibold text-slate-900 dark:text-zinc-50">
-                    {q.prompt[interfaceLang]}
+                  <p className="text-sm font-semibold text-slate-900 dark:text-zinc-50 leading-relaxed">
+                    {pickLocalizedText(q.prompt, activeContentLang)}
                   </p>
 
-                  {q.options ? (
+                  {q.options && q.options.length > 0 ? (
                     <div className="space-y-2">
                       {q.options.map((opt, optIdx) => {
                         const selected = answers[q.id] === String(optIdx);
@@ -286,7 +425,7 @@ export function DiagnosticsView({
                                 : 'border-slate-200 dark:border-zinc-700 hover:border-slate-400'
                             }`}
                           >
-                            {opt[interfaceLang]}
+                            {pickLocalizedText(opt, activeContentLang)}
                           </button>
                         );
                       })}
@@ -301,11 +440,7 @@ export function DiagnosticsView({
                           [q.id]: e.target.value,
                         }))
                       }
-                      placeholder={
-                        interfaceLang === 'kk'
-                          ? 'Жауабыңызды жазыңыз...'
-                          : 'Введите ответ (число или слово)...'
-                      }
+                      placeholder={contentUiLabels.answerPlaceholder}
                       className="w-full px-3.5 py-2.5 text-sm rounded-xl border border-slate-300 dark:border-zinc-700 bg-white dark:bg-zinc-950"
                     />
                   )}
@@ -319,7 +454,7 @@ export function DiagnosticsView({
               <button
                 type="button"
                 disabled={submitting}
-                onClick={handleSubmit}
+                onClick={() => void handleSubmit()}
                 className="w-full py-3 text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-xl transition-colors cursor-pointer"
               >
                 {submitting
@@ -350,10 +485,11 @@ export function DiagnosticsView({
 
                   <button
                     type="button"
-                    onClick={retryWithNewQuestions}
-                    className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl cursor-pointer"
+                    disabled={generating}
+                    onClick={() => void startTest()}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 rounded-xl cursor-pointer"
                   >
-                    <RefreshCw className="w-3.5 h-3.5" />
+                    <RefreshCw className={`w-3.5 h-3.5 ${generating ? 'animate-spin' : ''}`} />
                     <span>
                       {interfaceLang === 'kk'
                         ? 'Жаңа тапсырмалармен қайта өту'
@@ -453,8 +589,8 @@ export function DiagnosticsView({
                           <XCircle className="w-4 h-4 text-red-600 shrink-0" />
                         )}
                         <span>
-                          {interfaceLang === 'kk' ? 'Тапсырма' : 'Задание'} #{idx + 1} ·{' '}
-                          {interfaceLang === 'kk' ? 'Дұрыс жауап' : 'Ответ'}: {item.correctAnswer}
+                          {contentUiLabels.taskLabel} #{idx + 1} ·{' '}
+                          {contentUiLabels.correctLabel}: {item.correctAnswer}
                         </span>
                       </div>
                       <p className="text-slate-600 dark:text-zinc-400 pl-6">

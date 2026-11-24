@@ -1,4 +1,6 @@
 import type {
+  BilingualText,
+  ContentLang,
   CurriculumSection,
   Lang,
   StudyProfile,
@@ -1480,4 +1482,61 @@ export function getSchoolStageInfo(grade: number): SchoolStageInfo {
     allowsProfileChoice: true,
   };
 }
+
+export function resolveSubjectContentLang(
+  subjectId: string,
+  fallbackLang: Lang
+): ContentLang {
+  if (subjectId === 'russian_lang' || subjectId === 'russian_lit') {
+    return 'ru';
+  }
+  if (subjectId === 'english_lang') {
+    return 'en';
+  }
+  if (
+    subjectId === 'kazakh_lang' ||
+    subjectId === 'kazakh_lit' ||
+    subjectId === 'alippe'
+  ) {
+    return 'kk';
+  }
+  return fallbackLang;
+}
+
+export function pickLocalizedText(
+  text: BilingualText | undefined,
+  lang: ContentLang
+): string {
+  if (!text) return '';
+  if (lang === 'en') return text.en || text.ru || text.kk || '';
+  if (lang === 'ru') return text.ru || text.kk || text.en || '';
+  return text.kk || text.ru || text.en || '';
+}
+
+export function getCurriculumSummaryForPrompt(
+  subjectId: string,
+  grade: number,
+  profile: StudyProfile,
+  contentLang: ContentLang
+): string {
+  const subj = getSubjectById(subjectId);
+  if (!subj) return '';
+  const summaryLang: Lang = contentLang === 'kk' ? 'kk' : 'ru';
+  const sections = getSectionsForGradeAndProfile(subj, grade, profile);
+  if (sections.length === 0) {
+    return `${subj.name[summaryLang]} (${grade})`;
+  }
+  return sections
+    .map((sec) => {
+      const topicLines = sec.topics
+        .map(
+          (tp) =>
+            `  - ${tp.title[summaryLang]} (цель: ${tp.learningObjective[summaryLang]}; ожидаемый результат: ${tp.expectedResult[summaryLang]})`
+        )
+        .join('\n');
+      return `${sec.title[summaryLang]}:\n${topicLines}`;
+    })
+    .join('\n');
+}
+
 

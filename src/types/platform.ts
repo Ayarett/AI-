@@ -1,4 +1,5 @@
 export type Lang = 'kk' | 'ru';
+export type ContentLang = 'kk' | 'ru' | 'en';
 export type UserRole = 'student' | 'teacher';
 export type StudyProfile = 'general' | 'humanitarian' | 'physmath';
 export type DifficultyLevel = 'basic' | 'medium' | 'advanced';
@@ -18,6 +19,7 @@ export type QuestionFormat =
 export interface BilingualText {
   kk: string;
   ru: string;
+  en?: string;
 }
 
 export interface CurriculumTopic {
@@ -140,6 +142,19 @@ export interface DiagnosticQuestion {
   variantGroup: 1 | 2;
 }
 
+export interface ClientDiagnosticQuestion {
+  id: string;
+  subjectId: string;
+  grade: number;
+  difficulty: DifficultyLevel;
+  format: QuestionFormat;
+  goalCode: string;
+  goalLabel: BilingualText;
+  prompt: BilingualText;
+  passage?: BilingualText;
+  options?: BilingualText[];
+}
+
 export interface DiagnosticTopicBreakdown {
   goalLabel: string;
   correct: number;
@@ -151,6 +166,7 @@ export interface DiagnosticAttempt {
   id: string;
   subjectId: string;
   subjectName: string;
+  contentLang?: ContentLang;
   targetGrade: number;
   scope: 'subject' | 'section' | 'topic' | 'previous_grade';
   difficulty: DifficultyLevel;
